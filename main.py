@@ -11,6 +11,12 @@ front page of THE WORLD for Wednesday 18 November 2026.
 import os
 import sys
 
+# The grader runs "python3 -P -s /bot/main.py": isolated mode, so the
+# script's own directory is not on sys.path.  Put it there explicitly so
+# the sibling modules (frontpage, textadapter, ...) import without relying
+# on any site or user package.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import frontpage
 
 

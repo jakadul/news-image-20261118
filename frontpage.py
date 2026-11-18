@@ -17,7 +17,7 @@ closing strip lands exactly on the foot rule.  Nothing is guessed at.
 
 Public API
 ----------
-render_page(audit=None)   -> PIL.Image, RGB, 1200 x 1600
+render_page(audit=None)   -> image, RGB, 1200 x 1600
 save_page(path, audit=None)
 overruns(audit)           -> blocks wider than the column they sit in
 """
@@ -27,7 +27,8 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+import textadapter
+from textadapter import PageCanvas, Type as _TypeBase, Text
 
 # --------------------------------------------------------------------------
 # page geometry and the grid
@@ -79,10 +80,8 @@ STAR_FAINT = (150, 152, 158)
 # --------------------------------------------------------------------------
 
 _FONT_DIRS = (
-    "/usr/share/fonts/truetype/liberation",
-    "/usr/share/fonts/liberation",
+    __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'fonts'),
     "/usr/local/share/fonts",
-    "/usr/share/fonts/truetype/dejavu",
     "/System/Library/Fonts/Supplemental",
     "C:/Windows/Fonts",
 )
@@ -113,24 +112,11 @@ def _resolve_font(family: str, style: str) -> Optional[str]:
     return None
 
 
-class Type:
+class Type(_TypeBase):
     """Font cache.  Sizes are design pixels; the face is built at SS x size."""
 
     def __init__(self, scale: int) -> None:
-        self.scale = scale
-        self._cache = {}
-
-    def get(self, family: str, style: str, size: float) -> ImageFont.FreeTypeFont:
-        px = max(1, int(round(size * self.scale)))
-        key = (family, style, px)
-        if key not in self._cache:
-            path = _resolve_font(family, style)
-            if path is None:
-                font = ImageFont.load_default(px)
-            else:
-                font = ImageFont.truetype(path, px)
-            self._cache[key] = font
-        return self._cache[key]
+        super().__init__(scale, _resolve_font)
 
 
 # --------------------------------------------------------------------------
@@ -138,320 +124,11 @@ class Type:
 # --------------------------------------------------------------------------
 
 
-class Canvas:
+class Canvas(PageCanvas):
+    """The page's drawing surface: stdlib raster, TrueType text."""
+
     def __init__(self, scale: int) -> None:
-        self.scale = scale
-        self.image = Image.new("RGB", (PAGE_W * scale, PAGE_H * scale), PAPER)
-        self.draw = ImageDraw.Draw(self.image)
-        self.type = Type(scale)
-
-    # -- geometry ---------------------------------------------------------
-
-    def _s(self, value: float) -> float:
-        return value * self.scale
-
-    def _px(self, width: float) -> int:
-        return max(1, int(round(width * self.scale)))
-
-    # -- rules ------------------------------------------------------------
-
-    def rule(self, x0: float, y0: float, x1: float, y1: float,
-             width: float = 1.0, fill=INK) -> None:
-        self.draw.line(
-            [self._s(x0), self._s(y0), self._s(x1), self._s(y1)],
-            fill=fill, width=self._px(width))
-
-    def dashed(self, x0: float, y0: float, x1: float, y1: float,
-               dash: float = 7.0, gap: float = 5.0,
-               width: float = 1.4, fill=INK) -> None:
-        total = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-        if total <= 0:
-            return
-        ux, uy = (x1 - x0) / total, (y1 - y0) / total
-        pos = 0.0
-        while pos < total:
-            end = min(pos + dash, total)
-            self.draw.line(
-                [self._s(x0 + ux * pos), self._s(y0 + uy * pos),
-                 self._s(x0 + ux * end), self._s(y0 + uy * end)],
-                fill=fill, width=self._px(width))
-            pos = end + gap
-
-    def rect(self, x0, y0, x1, y1, fill=None, outline=None,
-             width: float = 1.0) -> None:
-        self.draw.rectangle(
-            [self._s(x0), self._s(y0), self._s(x1), self._s(y1)],
-            fill=fill, outline=outline, width=self._px(width))
-
-    def ellipse(self, x0, y0, x1, y1, outline=None, fill=None,
-                width: float = 1.0) -> None:
-        self.draw.ellipse(
-            [self._s(x0), self._s(y0), self._s(x1), self._s(y1)],
-            outline=outline, fill=fill, width=self._px(width))
-
-    def polygon(self, points: Sequence[Tuple[float, float]], outline=INK,
-                fill=None, width: float = 1.0) -> None:
-        pts = [(self._s(x), self._s(y)) for x, y in points]
-        self.draw.polygon(pts, outline=outline, fill=fill)
-        if fill is None:
-            self.draw.line(list(pts) + [pts[0]], fill=outline,
-                           width=self._px(width), joint="curve")
-
-    def dot(self, cx: float, cy: float, r: float, fill=INK) -> None:
-        self.draw.ellipse(
-            [self._s(cx - r), self._s(cy - r), self._s(cx + r), self._s(cy + r)],
-            fill=fill)
-
-    def ring(self, cx: float, cy: float, r: float, width: float = 1.4,
-             fill=INK) -> None:
-        self.draw.ellipse(
-            [self._s(cx - r), self._s(cy - r), self._s(cx + r), self._s(cy + r)],
-            outline=fill, width=self._px(width))
-
-    # -- measuring --------------------------------------------------------
-
-    def width(self, text: str, font: ImageFont.FreeTypeFont) -> float:
-        return self.draw.textlength(text, font=font) / self.scale
-
-    def advance(self, ch: str, font) -> float:
-        return self.draw.textlength(ch, font=font) / self.scale
-
-    def tracked_width(self, text: str, font, tracking: float,
-                      word_extra: float = 0.0) -> float:
-        if not text:
-            return 0.0
-        total = 0.0
-        for i, ch in enumerate(text):
-            total += self.advance(ch, font)
-            if i:
-                total += word_extra if text[i - 1] == " " else tracking
-        return total
-
-    def cap_height(self, font) -> float:
-        box = self.draw.textbbox((0, 0), "H", font=font, anchor="ls")
-        return -box[1] / self.scale
-
-    def ascent(self, font) -> float:
-        return font.getmetrics()[0] / self.scale
-
-    def descent(self, font) -> float:
-        return font.getmetrics()[1] / self.scale
-
-    # -- drawing text -----------------------------------------------------
-
-    def text(self, x: float, y: float, text: str, font, fill=INK,
-             anchor: str = "ls") -> None:
-        self.draw.text((self._s(x), self._s(y)), text, font=font, fill=fill,
-                       anchor=anchor)
-
-    def tracked(self, x: float, y: float, text: str, font, tracking: float,
-                fill=INK, anchor: str = "ls", word_extra: float = 0.0) -> float:
-        """Letterspaced text on a baseline.  Returns the width used."""
-        if not text:
-            return 0.0
-        total = self.tracked_width(text, font, tracking, word_extra)
-        if anchor[0] == "m":
-            cursor = x - total / 2.0
-        elif anchor[0] == "r":
-            cursor = x - total
-        else:
-            cursor = x
-        for i, ch in enumerate(text):
-            if ch != " ":
-                self.draw.text((self._s(cursor), self._s(y)), ch, font=font,
-                               fill=fill, anchor="ls")
-            cursor += self.advance(ch, font)
-            if i + 1 < len(text):
-                cursor += word_extra if ch == " " else tracking
-        return total
-
-    def justify(self, x0: float, x1: float, y: float, text: str, font,
-                fill=INK, word_extra_ratio: float = 0.06) -> float:
-        """Set text so its tracked width is exactly x1 - x0.
-
-        The tracking is solved rather than guessed, so the nameplate is flush
-        to the measure on both sides rather than near it.
-        """
-        target = x1 - x0
-        gaps = len(text) - 1
-        if gaps <= 0:
-            self.text(x0, y, text, font, fill=fill)
-            return target
-        natural = self.width(text, font)
-        word_extra = word_extra_ratio * (natural / max(1, len(text)))
-        fixed = text.count(" ") * word_extra
-        track = (target - natural - fixed) / gaps
-        self.tracked(x0, y, text, font, track, fill=fill, word_extra=word_extra)
-        return target
-
-    # -- wrapping ---------------------------------------------------------
-
-    def wrap(self, text: str, font, max_w: float) -> List[str]:
-        """Greedy wrap measured in pixels, never in characters."""
-        words = text.split()
-        lines: List[str] = []
-        current = ""
-        for word in words:
-            trial = word if not current else current + " " + word
-            if self.width(trial, font) <= max_w or not current:
-                current = trial
-            else:
-                lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-        return lines
-
-    def wrap_balanced(self, text: str, font, max_w: float) -> List[str]:
-        """A wrap that refuses to leave a single word alone on the last line."""
-        lines = self.wrap(text, font, max_w)
-        if len(lines) < 2:
-            return lines
-        last = lines[-1].split()
-        if len(last) == 1:
-            prev = lines[-2].split()
-            if len(prev) > 1:
-                moved = prev[-1]
-                trial_prev = " ".join(prev[:-1])
-                trial_last = moved + " " + lines[-1]
-                if (self.width(trial_prev, font) <= max_w
-                        and self.width(trial_last, font) <= max_w):
-                    lines[-2] = trial_prev
-                    lines[-1] = trial_last
-        return lines
-
-    def wrap_even(self, text: str, font, max_widths: Sequence[float],
-                  n_lines: int) -> List[str]:
-        """Set text over exactly n_lines lines with the ragging evened out.
-
-        The greedy wrap leaves whatever is left on the last line, which is how
-        a brief ends on a single word.  This solves the break points so the
-        slack is shared between the lines instead: it minimises the sum of the
-        squared shortfalls against each line's own measure, and forbids a
-        one-word last line when there is more than one line to fill.
-        """
-        words = text.split()
-        n = len(words)
-        if n_lines < 2 or n < 2:
-            return self.wrap(text, font, max_widths[0])
-
-        space = self.width(" ", font)
-        wide = [[0.0] * (n + 1) for _ in range(n)]
-        for i in range(n):
-            acc = 0.0
-            for j in range(i + 1, n + 1):
-                acc += self.width(words[j - 1], font)
-                if j - 1 > i:
-                    acc += space
-                wide[i][j] = acc
-
-        inf = float("inf")
-        best = [[inf] * (n + 1) for _ in range(n_lines + 1)]
-        back = [[-1] * (n + 1) for _ in range(n_lines + 1)]
-        best[0][0] = 0.0
-        for k in range(1, n_lines + 1):
-            limit = max_widths[min(k - 1, len(max_widths) - 1)]
-            for j in range(1, n + 1):
-                for i in range(j - 1, -1, -1):
-                    if wide[i][j] > limit:
-                        break
-                    if best[k - 1][i] == inf:
-                        continue
-                    slack = limit - wide[i][j]
-                    penalty = 0.0
-                    if k == n_lines and j == n and (j - i) < 2 and n > 2:
-                        penalty = 1.0e7
-                    cost = best[k - 1][i] + slack * slack + penalty
-                    if cost < best[k][j]:
-                        best[k][j] = cost
-                        back[k][j] = i
-        if best[n_lines][n] == inf:
-            return self.wrap(text, font, max_widths[0])
-
-        lines: List[str] = []
-        j = n
-        for k in range(n_lines, 0, -1):
-            i = back[k][j]
-            lines.append(" ".join(words[i:j]))
-            j = i
-        lines.reverse()
-        return lines
-
-    def fit_lines(self, text: str, family: str, style: str, max_w: float,
-                  lines_wanted: int, lo: float, hi: float,
-                  step: float = 0.25):
-        """Largest size whose balanced wrap makes exactly lines_wanted lines."""
-        size = hi
-        while size >= lo:
-            font = self.type.get(family, style, size)
-            lines = self.wrap_balanced(text, font, max_w)
-            if len(lines) == lines_wanted:
-                return size, lines
-            size -= step
-        fallback = self.wrap_balanced(text, self.type.get(family, style, lo),
-                                      max_w)
-        return lo, fallback
-
-    def fit_balanced(self, text: str, family: str, style: str, measure: float,
-                     lines_wanted: int, lo: float, hi: float,
-                     max_fill: float = 0.95, min_fill: float = 0.55):
-        """Largest-and-fullest wrap: no line crowds the measure, none is a stub.
-
-        Every size that yields exactly lines_wanted lines within
-        max_fill * measure is scored by the fill of its shortest line, and the
-        fullest wins.  That is what stops a headline running a line to within
-        a few pixels of the trim while leaving a widow under it.
-        """
-        best = None
-        size = lo
-        while size <= hi:
-            font = self.type.get(family, style, size)
-            lines = self.wrap_balanced(text, font, measure * max_fill)
-            if len(lines) == lines_wanted:
-                widths = [self.width(line, font) for line in lines]
-                if max(widths) <= measure * max_fill:
-                    fill = min(widths) / measure
-                    if fill >= min_fill and (best is None or fill > best[2]):
-                        best = (size, lines, fill)
-            size += 0.25
-        if best is not None:
-            return best[0], best[1]
-        return self.fit_lines(text, family, style, measure * max_fill,
-                              lines_wanted, lo, hi)
-
-    def fit_one_line(self, text: str, family: str, style: str, measure: float,
-                     lo: float, hi: float, max_fill: float = 0.97):
-        """Largest size at which the text still sets on a single line."""
-        best_size = lo
-        size = lo
-        while size <= hi:
-            if self.width(text, self.type.get(family, style, size)) \
-                    <= measure * max_fill:
-                best_size = size
-                size += 0.25
-            else:
-                break
-        return best_size, self.type.get(family, style, best_size)
-
-    def fit_tracked(self, text: str, family: str, style: str, target: float,
-                    tracking_ratio: float, lo: float = 20.0, hi: float = 260.0,
-                    word_extra_ratio: float = 0.0):
-        """Largest size whose tracked width fits target."""
-        best_font = self.type.get(family, style, lo)
-        best_track = tracking_ratio * lo
-        best_word = word_extra_ratio * lo
-        size = lo
-        while size <= hi:
-            font = self.type.get(family, style, size)
-            track = tracking_ratio * size
-            word = word_extra_ratio * size
-            if self.tracked_width(text, font, track, word) <= target:
-                best_font, best_track, best_word = font, track, word
-                size += 0.25
-            else:
-                break
-        return best_font, best_track, best_word
-
+        super().__init__(scale, PAGE_W, PAGE_H, PAPER, INK, _resolve_font)
 
 # --------------------------------------------------------------------------
 # the copy: wire register, factual, no exclamation marks
@@ -635,8 +312,8 @@ def _masthead(c: Canvas, y: float, audit: list) -> float:
     # dateline strap: a clear x-height or more above and below the strap
     d_font = c.type.get("sans", "bold", SZ_DATELINE)
     d_cap = c.cap_height(d_font)
-    d_x = c.draw.textbbox((0, 0), "x", font=d_font, anchor="ls")
-    x_height = -d_x[1] / c.scale
+    d_x = c.x_height(d_font)
+    x_height = d_x
     pad = 20.0
     d_base = rule_y + pad + d_cap
     c.tracked(CONTENT_X0, d_base, DATELINE_LEFT, d_font, SZ_DATELINE * TRACK_SMALLCAPS,
@@ -1168,7 +845,7 @@ def _distribute(slack: float) -> Dict[str, float]:
     return extra
 
 
-def render_page(audit: Optional[list] = None) -> Image.Image:
+def render_page(audit: Optional[list] = None):
     """Draw the whole front page and return the downsampled RGB image.
 
     Pass one stacks the page at its base gaps and measures where it lands;
@@ -1187,14 +864,7 @@ def render_page(audit: Optional[list] = None) -> Image.Image:
     report.append(("slack_distributed", slack, 0.0))
     report.append(("strip_closing_rule", landed, TARGET_END))
 
-    return final_canvas.image.resize((PAGE_W, PAGE_H), _resample())
-
-
-def _resample():
-    try:
-        return Image.Resampling.LANCZOS
-    except AttributeError:      # Pillow < 9.1
-        return Image.LANCZOS
+    return final_canvas.image.resize((PAGE_W, PAGE_H))
 
 
 def save_page(path: str, audit: Optional[list] = None) -> Tuple[int, int]:
